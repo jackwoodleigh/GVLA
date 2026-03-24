@@ -84,6 +84,7 @@ class FinetuneConfig:
     use_film: bool = False                           # If True, uses FiLM to infuse language inputs into visual features
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
+    use_vggt: bool = False                           # If True, adds VGGT as an additional vision module with separate normalization
     phase1_path: str = "None"
 
     # Training configuration
@@ -503,6 +504,7 @@ def save_training_checkpoint(
     train_dataset,
     distributed_state,
     new_state_dict,
+    vggt_projector=None, 
     
 ) -> None:
     """
@@ -570,6 +572,9 @@ def save_training_checkpoint(
             torch.save(
                 vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
             )
+
+        if cfg.use_vggt and vggt_projector is not None:
+            torch.save(vggt_projector.state_dict(), checkpoint_dir / f"vggt_projector--{checkpoint_name_suffix}")
 
     # Wait for model components to be saved
     dist.barrier()
@@ -823,6 +828,37 @@ def finetune(cfg: FinetuneConfig) -> None:
             low_cpu_mem_usage=False,
             trust_remote_code=False,
             ).to(device_id)
+        
+    if cfg.use_vggt:
+        from vggt.models.vggt import VGGT
+        from prismatic.extern.hf.modeling_prismatic import VGGTProjector
+        vla.vggt = VGGT.from_pretrained("facebook/vggt-1b").to(device_id)
+        for param in vla.vggt.parameters():
+            param.requires_grad = False
+        vggt_projector = init_module(
+            VGGTProjector,
+            "vggt_projector",
+            cfg,
+            device_id,
+            {"vggt_dim": 2048, "llm_dim": vla.llm_dim},
+            to_bf16=True,
+        )
+        vla.vggt_projector = vggt_projector.module
+        
+    else:
+        vggt_projector = None
+    
+    # Patch processor with VGGT normalization if needed
+    if cfg.use_vggt:
+        VGGT_SIZE = 518
+        ip = processor.image_processor
+        ip.input_sizes.append((3, VGGT_SIZE, VGGT_SIZE))
+        ip.means.append((0.0, 0.0, 0.0))
+        ip.stds.append((1.0, 1.0, 1.0))
+        ip.tvf_resize_params.append({"size": VGGT_SIZE, "interpolation": "bicubic", "max_size": None, "antialias": True})
+        ip.tvf_crop_params.append({"output_size": (VGGT_SIZE, VGGT_SIZE)})
+        ip.tvf_normalize_params.append({"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0], "inplace": False})
+
 
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
@@ -906,6 +942,10 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
+
+    if cfg.use_vggt and vggt_projector is not None:
+        trainable_params += [p for p in vggt_projector.parameters() if p.requires_grad]
+
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
@@ -1015,6 +1055,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
+        if cfg.use_vggt:
+            vla.module.vggt.eval()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
             # Compute training metrics and loss
@@ -1095,6 +1137,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                     new_state_dict=RAW_STATE_DICT,
+                    vggt_projector=vggt_projector if cfg.use_vggt else None,
                 )
 
             # Test model on validation set
@@ -1115,6 +1158,8 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
                 # Set model back to training mode after validation
                 vla.train()
+                if cfg.use_vggt:
+                    vla.module.vggt.eval()
 
             # Stop training when max_steps is reached
             if log_step == cfg.max_steps:
