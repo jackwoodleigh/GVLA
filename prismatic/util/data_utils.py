@@ -162,9 +162,16 @@ class PaddedCollatorForActionPrediction:
         else:
             proprio = None
 
+        # Stack VGGT pixel values if present
+        if "vggt_pixel_values" in instances[0]:
+            vggt_pixel_values = torch.stack([instance["vggt_pixel_values"] for instance in instances])
+        else:
+            vggt_pixel_values = None
+
         output = dict(
             pixel_values=pixel_values,
             proprio=proprio,
+            vggt_pixel_values=vggt_pixel_values,
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=labels,

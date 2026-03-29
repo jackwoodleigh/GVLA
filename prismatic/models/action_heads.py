@@ -45,7 +45,8 @@ class L1RegressionActionHead(nn.Module):
             actions_hidden_states, 
             proprio=None, 
             proprio_projector=None,
-            phase="Inference"
+            phase="Inference",
+            num_task_tokens=None
             ):
         batch_size = actions_hidden_states.shape[0]
         device = actions_hidden_states.device
@@ -54,8 +55,9 @@ class L1RegressionActionHead(nn.Module):
         proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
         proprio_features = proprio_features.unsqueeze(dim=1)  # (bsz, 1, llm_dim)
 
-        task_hidden_states = actions_hidden_states[:, :, :self.num_task_tokens, :]
-        actions_hidden_states = actions_hidden_states[:, :, self.num_task_tokens:, :]
+        n_task = num_task_tokens if num_task_tokens is not None else self.num_task_tokens
+        task_hidden_states = actions_hidden_states[:, :, :n_task, :]
+        actions_hidden_states = actions_hidden_states[:, :, n_task:, :]
 
         cond_actions_hidden_states = torch.zeros(
             (batch_size, self.action_dim * NUM_ACTIONS_CHUNK, self.hidden_dim),

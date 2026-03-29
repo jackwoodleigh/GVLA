@@ -24,7 +24,7 @@ from prismatic.vla.constants import ACTION_DIM, ACTION_PROPRIO_NORMALIZATION_TYP
 from prismatic.vla.datasets.rlds import make_interleaved_dataset, make_single_dataset
 from prismatic.vla.datasets.rlds.oxe import OXE_NAMED_MIXTURES, get_oxe_dataset_kwargs_and_weights
 
-
+import torchvision.transforms.functional as TVF
 
 @dataclass
 class RLDSBatchTransform:
@@ -36,6 +36,7 @@ class RLDSBatchTransform:
     use_wrist_image: bool = False
     use_proprio: bool = False
     use_minivlm: bool = False
+    use_vggt: bool = False
 
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
@@ -140,6 +141,10 @@ class RLDSBatchTransform:
             proprio = rlds_batch["observation"]["proprio"]
             return_dict["proprio"] = proprio
 
+        if self.use_vggt:
+            vggt_img = img.resize((224, 224), Image.BICUBIC)
+            vggt_t = TVF.to_tensor(vggt_img)  # [3, 518, 518]
+            return_dict["vggt_pixel_values"] = vggt_t
         return return_dict
     
     

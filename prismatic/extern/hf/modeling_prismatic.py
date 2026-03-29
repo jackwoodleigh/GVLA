@@ -243,7 +243,7 @@ class VGGTProjector(nn.Module):
         self.proj = nn.Linear(vggt_dim, llm_dim, bias=True)
 
     def forward(self, vggt_tokens: torch.Tensor) -> torch.Tensor:
-        # vggt_tokens: [B, 24, P, 2048] -> [B, 24, P, llm_dim]
+        # vggt_tokens: [B, N_patches, 2048] -> [B, N_patches, llm_dim]
         return self.proj(vggt_tokens)
 
 
@@ -550,6 +550,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        vggt_pixel_values=None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -621,16 +622,13 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )  # (B, lang_seq_len, llm_dim)
 
             # Get visual features
-            vggt_features = None
-            if hasattr(self, 'vggt') and self.vggt_projector is not None:
-                vla_channels = 6 * self.vision_backbone.get_num_images_in_input()
-                vla_pixels, vggt_pixels = torch.split(pixel_values, [vla_channels, 3], dim=1)
+            if hasattr(self, 'vggt') and vggt_pixel_values is not None:
                 with torch.no_grad():
-                    vggt_tokens_list, _ = self.vggt.aggregator(vggt_pixels.unsqueeze(1))
-                vggt_stacked = torch.stack(vggt_tokens_list, dim=1).squeeze(2)
-                vggt_features = self.vggt_projector(vggt_stacked)
-                projected_patch_embeddings = self._process_vision_features(vla_pixels, language_embeddings, use_film)
+                    vggt_tokens_list, patch_start_idx = self.vggt.aggregator(vggt_pixel_values.unsqueeze(1))
+                self._vggt_raw_cache = (vggt_tokens_list, patch_start_idx)
+                projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
             else:
+                self._vggt_raw_cache = None
                 projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
 
 
@@ -866,8 +864,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Extract hidden states for action tokens
         multi_layer_hidden_states = []
+
+        vggt_task_states = None
+        if self._vggt_raw_cache is not None and action_head is not None:
+            vggt_tokens_list, vggt_patch_start = self._vggt_raw_cache
+            vggt_task_layers = []
+            for vggt_layer in vggt_tokens_list:
+                vggt_patches = vggt_layer.squeeze(1)[:, vggt_patch_start:]           # [B, N_patches, 2048]
+                vggt_projected = self.vggt_projector(vggt_patches.to(torch.bfloat16))  # [B, N_patches, llm_dim]
+                vggt_task_layers.append(vggt_projected.unsqueeze(1))                   # [B, 1, N_patches, llm_dim]
+            vggt_task_states = torch.cat(vggt_task_layers, dim=1)                      # [B, num_vggt_layers, N_patches, llm_dim]
+
+        num_vggt_layers = vggt_task_states.shape[1] if vggt_task_states is not None else 0
         
-        for item in language_model_output.hidden_states[0:]:
+        for layer_idx, item in enumerate(language_model_output.hidden_states[0:]):
             # last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
             # Get hidden states for text portion of prompt+response (after the vision patches)
             text_hidden_states = item
@@ -875,7 +885,13 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             actions_hidden_states = text_hidden_states[:, NUM_PATCHES+ NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + NUM_TOKENS, :,].reshape(1, 1, NUM_TOKENS, -1).to(torch.bfloat16)
             
             batch_size = item.shape[0]
-            task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES , -1)
+            if vggt_task_states is not None:
+                # Use raw VGGT features as task conditioning (clamp to last layer if fewer VGGT layers)
+                vggt_idx = min(layer_idx, num_vggt_layers - 1)
+                task_latten_states = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
+            else:
+                task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES , -1)
+            
             all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
             multi_layer_hidden_states.append(all_hidden_states)
             
@@ -885,9 +901,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Handle different prediction methods
         if action_head is not None:
             # L1 regression prediction
+            vggt_num_task = vggt_task_states.shape[2] if vggt_task_states is not None else None
             normalized_actions = action_head.predict_action(multi_layer_hidden_states,
                                                 proprio=proprio,
-                                                proprio_projector=proprio_projector)
+                                                proprio_projector=proprio_projector,
+                                                num_task_tokens=vggt_num_task
+                                                )
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
@@ -962,15 +981,14 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        vggt_features = None
-        if hasattr(self, 'vggt') and self.vggt_projector is not None:
-            vla_channels = 6 * self.vision_backbone.get_num_images_in_input()
-            vla_pixels, vggt_pixels = torch.split(pixel_values, [vla_channels, 3], dim=1)
-            vggt_tokens_list, _ = self.vggt.aggregator(vggt_pixels.unsqueeze(1))
-            vggt_stacked = torch.stack(vggt_tokens_list, dim=1).squeeze(2)
-            vggt_features = self.vggt_projector(vggt_stacked)
-            projected_patch_embeddings = self._process_vision_features(vla_pixels, language_embeddings, use_film)
+        if hasattr(self, 'vggt') and 'vggt_pixel_values' in kwargs and kwargs['vggt_pixel_values'] is not None:
+            vggt_pixel_values = kwargs['vggt_pixel_values']
+            with torch.no_grad():
+                vggt_tokens_list, patch_start_idx = self.vggt.aggregator(vggt_pixel_values.unsqueeze(1))
+            self._vggt_raw_cache = (vggt_tokens_list, patch_start_idx)
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
         else:
+            self._vggt_raw_cache = None
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
 
 

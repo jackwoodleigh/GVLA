@@ -290,6 +290,7 @@ def run_forward_pass(
     vla,
     action_head,
     proprio_projector,
+    vggt_projector, 
     batch,
     action_tokenizer,
     device_id,
@@ -338,6 +339,7 @@ def run_forward_pass(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
             pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+            vggt_pixel_values=batch["vggt_pixel_values"].to(torch.bfloat16).to(device_id) if cfg.use_vggt else None,
             labels=batch["labels"],
             output_hidden_states=True,
             proprio=batch["proprio"] if use_proprio else None,
@@ -396,17 +398,40 @@ def run_forward_pass(
         # Get last layer hidden states
         multi_layer_hidden_states = []
         
-        for item in output.hidden_states[0:]:
+        # Optionally use raw VGGT features as task conditioning for the action head
+        vggt_task_states = None
+        vggt_num_task = None
+        if cfg is not None and cfg.use_vggt and vggt_projector is not None and hasattr(vla.module, '_vggt_raw_cache') and vla.module._vggt_raw_cache is not None:
+            vggt_tokens_list, vggt_patch_start = vla.module._vggt_raw_cache
+            vggt_task_layers = []
+            for vggt_layer in vggt_tokens_list:
+                vggt_patches = vggt_layer.squeeze(1)[:, vggt_patch_start:]                # [B, N_patches, 2048]
+                vggt_projected = vggt_projector.module(vggt_patches.to(torch.bfloat16))    # [B, N_patches, llm_dim]
+                vggt_task_layers.append(vggt_projected.unsqueeze(1))                       # [B, 1, N_patches, llm_dim]
+            vggt_task_states = torch.cat(vggt_task_layers, dim=1)                          # [B, num_vggt_layers, N_patches, llm_dim]
+            vggt_num_task = vggt_task_states.shape[2]
+
+        num_vggt_layers = vggt_task_states.shape[1] if vggt_task_states is not None else 0
+        
+        for layer_idx, item in enumerate(output.hidden_states[0:]):
             # last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
             # Get hidden states for text portion of prompt+response (after the vision patches)
             text_hidden_states = item[:, num_patches:-1]
             # Get hidden states for action portion of response
             batch_size = batch["input_ids"].shape[0]
-            # actions_hidden_states = text_hidden_states[:, -1, :].reshape(batch_size, 1, -1).to(torch.bfloat16)
+
             actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(batch_size, 1,NUM_TOKENS, -1).to(torch.bfloat16)
-            task_latten_states = item[:, :num_patches].reshape(batch_size, 1, num_patches , -1)
+
+            if vggt_task_states is not None:
+                # Use raw VGGT features as task conditioning (clamp to last layer if fewer VGGT layers)
+                vggt_idx = min(layer_idx, num_vggt_layers - 1)
+                task_latten_states = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
+            else:
+                task_latten_states = item[:, :num_patches].reshape(batch_size, 1, num_patches , -1)
+
             all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
             multi_layer_hidden_states.append(all_hidden_states)
+
         multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
 
         predicted_actions = action_head.module.predict_action(
@@ -414,6 +439,7 @@ def run_forward_pass(
             proprio=batch["proprio"] if use_proprio else None,
             proprio_projector=proprio_projector if use_proprio else None,
             phase=cfg.phase,
+            num_task_tokens=vggt_num_task
             )
 
         loss = torch.nn.L1Loss()(predicted_actions, ground_truth_actions)
@@ -655,6 +681,7 @@ def run_validation(
                 vla=vla,
                 action_head=action_head,
                 proprio_projector=proprio_projector,
+                vggt_projector=vggt_projector if cfg.use_vggt else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -733,7 +760,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", mode="offline")
+        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", mode="online")
 
     # Print detected constants
     print(
@@ -828,36 +855,18 @@ def finetune(cfg: FinetuneConfig) -> None:
             low_cpu_mem_usage=False,
             trust_remote_code=False,
             ).to(device_id)
-        
-    if cfg.use_vggt:
-        from vggt.models.vggt import VGGT
-        from prismatic.extern.hf.modeling_prismatic import VGGTProjector
-        vla.vggt = VGGT.from_pretrained("facebook/vggt-1b").to(device_id)
-        for param in vla.vggt.parameters():
-            param.requires_grad = False
-        vggt_projector = init_module(
-            VGGTProjector,
-            "vggt_projector",
-            cfg,
-            device_id,
-            {"vggt_dim": 2048, "llm_dim": vla.llm_dim},
-            to_bf16=True,
-        )
-        vla.vggt_projector = vggt_projector.module
-        
-    else:
-        vggt_projector = None
     
     # Patch processor with VGGT normalization if needed
-    if cfg.use_vggt:
-        VGGT_SIZE = 518
+    '''if cfg.use_vggt:
+        from torchvision.transforms import InterpolationMode
+        VGGT_SIZE = 224
         ip = processor.image_processor
         ip.input_sizes.append((3, VGGT_SIZE, VGGT_SIZE))
         ip.means.append((0.0, 0.0, 0.0))
         ip.stds.append((1.0, 1.0, 1.0))
-        ip.tvf_resize_params.append({"size": VGGT_SIZE, "interpolation": "bicubic", "max_size": None, "antialias": True})
+        ip.tvf_resize_params.append({"size": VGGT_SIZE, "interpolation": InterpolationMode.BICUBIC, "max_size": None, "antialias": True})
         ip.tvf_crop_params.append({"output_size": (VGGT_SIZE, VGGT_SIZE)})
-        ip.tvf_normalize_params.append({"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0], "inplace": False})
+        ip.tvf_normalize_params.append({"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0], "inplace": False})'''
 
 
     # Set number of images in VLA input
@@ -883,6 +892,28 @@ def finetune(cfg: FinetuneConfig) -> None:
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
+    
+    if cfg.use_vggt:
+        from vggt.models.vggt import VGGT
+        from prismatic.extern.hf.modeling_prismatic import VGGTProjector
+        # Get the underlying model (works whether LoRA is on or off)
+        base_vla = vla.base_model.model if cfg.use_lora else vla
+        base_vla.vggt = VGGT.from_pretrained("facebook/vggt-1b").to(torch.bfloat16).to(device_id)
+        for param in base_vla.vggt.parameters():
+            param.requires_grad = False
+        #vla.vggt.aggregator = torch.compile(vla.vggt.aggregator)
+        vggt_projector = init_module(
+            VGGTProjector,
+            "vggt_projector",
+            cfg,
+            device_id,
+            {"vggt_dim": 2048, "llm_dim": base_vla.llm_dim},
+            to_bf16=True,
+        )
+        #base_vla.vggt_projector = vggt_projector.module
+        print("RUNNING VGGT")
+    else:
+        vggt_projector = None
 
     # FiLM setup
     if cfg.use_film:
@@ -933,6 +964,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
+
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
 
     # Instantiate optimizer
@@ -996,7 +1028,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
-        use_minivlm=cfg.use_minivlm
+        use_minivlm=cfg.use_minivlm,
+        use_vggt=cfg.use_vggt,
         )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -1065,6 +1098,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 vla=vla,
                 action_head=action_head,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
+                vggt_projector=vggt_projector if cfg.use_vggt else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,

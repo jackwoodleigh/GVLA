@@ -237,6 +237,15 @@ class PrismaticVisionBackbone(nn.Module):
             return torch.cat(all_patches, dim=1)
 
 
+class VGGTProjector(nn.Module):
+    def __init__(self, vggt_dim: int, llm_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Linear(vggt_dim, llm_dim, bias=True)
+
+    def forward(self, vggt_tokens: torch.Tensor) -> torch.Tensor:
+        # vggt_tokens: [B, 24, P, 2048] -> [B, 24, P, llm_dim]
+        return self.proj(vggt_tokens)
+
 
 # === Prismatic Projector (nn.Module) Definitions ===
 class PrismaticProjector(nn.Module):
@@ -612,7 +621,18 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )  # (B, lang_seq_len, llm_dim)
 
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            vggt_features = None
+            if hasattr(self, 'vggt') and self.vggt_projector is not None:
+                vla_channels = 6 * self.vision_backbone.get_num_images_in_input()
+                vla_pixels, vggt_pixels = torch.split(pixel_values, [vla_channels, 3], dim=1)
+                with torch.no_grad():
+                    vggt_tokens_list, _ = self.vggt.aggregator(vggt_pixels.unsqueeze(1))
+                vggt_stacked = torch.stack(vggt_tokens_list, dim=1).squeeze(2)
+                vggt_features = self.vggt_projector(vggt_stacked)
+                projected_patch_embeddings = self._process_vision_features(vla_pixels, language_embeddings, use_film)
+            else:
+                projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
 
             # Process action embeddings
             if noisy_actions is not None:
@@ -942,7 +962,17 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        vggt_features = None
+        if hasattr(self, 'vggt') and self.vggt_projector is not None:
+            vla_channels = 6 * self.vision_backbone.get_num_images_in_input()
+            vla_pixels, vggt_pixels = torch.split(pixel_values, [vla_channels, 3], dim=1)
+            vggt_tokens_list, _ = self.vggt.aggregator(vggt_pixels.unsqueeze(1))
+            vggt_stacked = torch.stack(vggt_tokens_list, dim=1).squeeze(2)
+            vggt_features = self.vggt_projector(vggt_stacked)
+            projected_patch_embeddings = self._process_vision_features(vla_pixels, language_embeddings, use_film)
+        else:
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
