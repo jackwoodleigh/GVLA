@@ -423,9 +423,10 @@ def run_forward_pass(
             actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(batch_size, 1,NUM_TOKENS, -1).to(torch.bfloat16)
 
             if vggt_task_states is not None:
-                # Use raw VGGT features as task conditioning (clamp to last layer if fewer VGGT layers)
                 vggt_idx = min(layer_idx, num_vggt_layers - 1)
-                task_latten_states = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
+                vggt_cond = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
+                vlm_cond = item[:, :num_patches].reshape(batch_size, 1, num_patches, -1)
+                task_latten_states = torch.cat([vlm_cond, vggt_cond], dim=2)
             else:
                 task_latten_states = item[:, :num_patches].reshape(batch_size, 1, num_patches , -1)
 

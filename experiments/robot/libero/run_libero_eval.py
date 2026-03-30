@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
-
+import torch
 import draccus
 import numpy as np
 import tqdm
@@ -127,6 +127,7 @@ class GenerateConfig:
     save_version: str = "vla-adapter"                # version of 
     use_pro_version: bool = True                     # encourage to use the pro models we released.
     phase: str = "Inference"
+    use_vggt: bool = False
 
 
 
@@ -149,6 +150,29 @@ def initialize_model(cfg: GenerateConfig):
     # Load model
     model = get_model(cfg)
     model.set_version(cfg.save_version)
+
+    # Load VGGT + projector
+    if cfg.use_vggt:
+        from vggt.models.vggt import VGGT
+        from prismatic.extern.hf.modeling_prismatic import VGGTProjector
+        from experiments.robot.openvla_utils import find_checkpoint_file, load_component_state_dict
+ 
+        # Attach frozen VGGT backbone
+        model.vggt = VGGT.from_pretrained("facebook/vggt-1b").to(torch.bfloat16).to("cuda")
+        model.vggt.eval()
+        for p in model.vggt.parameters():
+            p.requires_grad = False
+ 
+        # Load and attach VGGT projector
+        vggt_proj = VGGTProjector(vggt_dim=2048, llm_dim=model.llm_dim).to(torch.bfloat16).to("cuda")
+        proj_ckpt_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vggt_projector")
+        state_dict = load_component_state_dict(proj_ckpt_path)
+        vggt_proj.load_state_dict(state_dict)
+        vggt_proj.eval()
+        model.vggt_projector = vggt_proj
+        logger.info(f"Loaded VGGT projector from {proj_ckpt_path}")
+
+        
     # Load proprio projector if needed
     proprio_projector = None
     if cfg.use_proprio:

@@ -739,6 +739,25 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     return processed_images
 
 
+def _preprocess_image_for_vggt(image: np.ndarray) -> torch.Tensor:
+    """
+    Preprocess a raw image for VGGT input.
+ 
+    Matches training-time preprocessing in RLDSBatchTransform exactly:
+      img.resize((224, 224), Image.BICUBIC) -> TVF.to_tensor(img)
+ 
+    Args:
+        image: Raw image as numpy array (H, W, 3), uint8
+ 
+    Returns:
+        torch.Tensor: Preprocessed image tensor [1, 3, 224, 224] in bfloat16
+    """
+    import torchvision.transforms.functional as TVF
+ 
+    pil_img = Image.fromarray(image).resize((224, 224), Image.BICUBIC)
+    vggt_tensor = TVF.to_tensor(pil_img).unsqueeze(0)  # [1, 3, 224, 224], float32 [0,1]
+    return vggt_tensor.to(DEVICE, dtype=torch.bfloat16)
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -808,6 +827,9 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
+        vggt_pixel_values = None
+        if hasattr(vla, 'vggt') and getattr(cfg, 'use_vggt', False):
+            vggt_pixel_values = _preprocess_image_for_vggt(obs["full_image"])
         
         # Generate action
         if action_head is None:
@@ -824,6 +846,7 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                vggt_pixel_values=vggt_pixel_values,
             )
 
     # Extract subset of actions for open loop steps

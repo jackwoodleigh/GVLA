@@ -240,7 +240,12 @@ class PrismaticVisionBackbone(nn.Module):
 class VGGTProjector(nn.Module):
     def __init__(self, vggt_dim: int, llm_dim: int) -> None:
         super().__init__()
-        self.proj = nn.Linear(vggt_dim, llm_dim, bias=True)
+        self.proj = nn.Sequential(
+            nn.LayerNorm(vggt_dim),
+            nn.Linear(vggt_dim, llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim),
+        )
 
     def forward(self, vggt_tokens: torch.Tensor) -> torch.Tensor:
         # vggt_tokens: [B, N_patches, 2048] -> [B, N_patches, llm_dim]
@@ -886,9 +891,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             
             batch_size = item.shape[0]
             if vggt_task_states is not None:
-                # Use raw VGGT features as task conditioning (clamp to last layer if fewer VGGT layers)
                 vggt_idx = min(layer_idx, num_vggt_layers - 1)
-                task_latten_states = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
+                vggt_cond = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
+                vlm_cond = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES, -1)
+                task_latten_states = torch.cat([vlm_cond, vggt_cond], dim=2)
             else:
                 task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES , -1)
             
