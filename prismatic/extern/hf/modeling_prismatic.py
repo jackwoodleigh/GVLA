@@ -840,6 +840,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         proprio=None,
         proprio_projector=None,
+        vggt_query_module=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
 
@@ -870,17 +871,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Extract hidden states for action tokens
         multi_layer_hidden_states = []
 
-        vggt_task_states = None
+        vggt_query_features = None
+        vggt_num_task = None
         if self._vggt_raw_cache is not None and action_head is not None:
             vggt_tokens_list, vggt_patch_start = self._vggt_raw_cache
-            vggt_task_layers = []
-            for vggt_layer in vggt_tokens_list:
-                vggt_patches = vggt_layer.squeeze(1)[:, vggt_patch_start:]           # [B, N_patches, 2048]
-                vggt_projected = self.vggt_projector(vggt_patches.to(torch.bfloat16))  # [B, N_patches, llm_dim]
-                vggt_task_layers.append(vggt_projected.unsqueeze(1))                   # [B, 1, N_patches, llm_dim]
-            vggt_task_states = torch.cat(vggt_task_layers, dim=1)                      # [B, num_vggt_layers, N_patches, llm_dim]
+            # Handle both DDP-wrapped (training) and bare (eval) module
+            module_fn = vggt_query_module.module if hasattr(vggt_query_module, 'module') else vggt_query_module
+            vggt_query_features = module_fn(
+                [layer.to(torch.bfloat16) for layer in vggt_tokens_list],
+                vggt_patch_start
+            )
+            vggt_num_task = vggt_query_features.shape[2]
 
-        num_vggt_layers = vggt_task_states.shape[1] if vggt_task_states is not None else 0
+        num_vggt_layers = vggt_query_features.shape[1] if vggt_query_features is not None else 0
+
         
         for layer_idx, item in enumerate(language_model_output.hidden_states[0:]):
             # last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
@@ -890,13 +894,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             actions_hidden_states = text_hidden_states[:, NUM_PATCHES+ NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + NUM_TOKENS, :,].reshape(1, 1, NUM_TOKENS, -1).to(torch.bfloat16)
             
             batch_size = item.shape[0]
-            if vggt_task_states is not None:
+            if vggt_query_features is not None:
                 vggt_idx = min(layer_idx, num_vggt_layers - 1)
-                vggt_cond = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
-                vlm_cond = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES, -1)
-                task_latten_states = torch.cat([vlm_cond, vggt_cond], dim=2)
+                task_latten_states = vggt_query_features[:, vggt_idx:vggt_idx+1, :, :]
             else:
-                task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES , -1)
+                task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES, -1)
             
             all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
             multi_layer_hidden_states.append(all_hidden_states)
@@ -907,7 +909,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Handle different prediction methods
         if action_head is not None:
             # L1 regression prediction
-            vggt_num_task = vggt_task_states.shape[2] if vggt_task_states is not None else None
             normalized_actions = action_head.predict_action(multi_layer_hidden_states,
                                                 proprio=proprio,
                                                 proprio_projector=proprio_projector,
@@ -1018,6 +1019,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_head=action_head,
             proprio=proprio, # [8]
             proprio_projector=proprio_projector,
+            vggt_query_module=kwargs.get('vggt_query_module', None),
             )
            
         # Unnormalize predicted actions

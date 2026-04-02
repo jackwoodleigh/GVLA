@@ -769,6 +769,7 @@ def get_vla_action(
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
     use_minivlm: bool = False,
+    vggt_query_module=None,
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -847,6 +848,7 @@ def get_vla_action(
                 action_head=action_head,
                 use_film=use_film,
                 vggt_pixel_values=vggt_pixel_values,
+                vggt_query_module=vggt_query_module,
             )
 
     # Extract subset of actions for open loop steps

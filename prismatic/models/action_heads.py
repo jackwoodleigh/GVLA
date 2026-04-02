@@ -342,8 +342,6 @@ class MLPResNetBlock_Pro(nn.Module):
         h_t: task tokens
         p:   possible conditioning vector (for FiLM)
         """
-        g = self.gating_factor
-        ratio_g = torch.tanh(g)
 
         # concat h_a and p
         h_adapter = torch.cat((h_a, p),dim=1)
@@ -390,7 +388,7 @@ class MLPResNetBlock_Pro(nn.Module):
         # attention scores
         attn_scores = [torch.matmul(q_1, k_tokens.transpose(-2, -1))]
         attn_scores.append(torch.matmul(q_1, k_adapter.transpose(-2, -1)))
-        attn_scores.append(torch.matmul(q_1, k_task.transpose(-2, -1)) * ratio_g)
+        attn_scores.append(torch.matmul(q_1, k_task.transpose(-2, -1)))
         attn_scores = torch.cat(attn_scores, dim=-1) / math.sqrt(self.head_dim)
         attn_weights = torch.softmax(attn_scores, dim=-1)
 

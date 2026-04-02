@@ -26,6 +26,7 @@ from torch.utils.data import DataLoader
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import wandb
+import math
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -85,6 +86,7 @@ class FinetuneConfig:
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
     use_vggt: bool = False                           # If True, adds VGGT as an additional vision module with separate normalization
+    gradient_warmup_steps: int = 0
     phase1_path: str = "None"
 
     # Training configuration
@@ -290,7 +292,7 @@ def run_forward_pass(
     vla,
     action_head,
     proprio_projector,
-    vggt_projector, 
+    vggt_query_module, 
     batch,
     action_tokenizer,
     device_id,
@@ -300,7 +302,8 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     use_pro_version=True,
-    cfg=None
+    cfg=None,
+    gradient_step_idx=None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -348,6 +351,7 @@ def run_forward_pass(
             noisy_action_projector=None,
             diffusion_timestep_embeddings=None,
             use_film=use_film,
+            
             )
 
     # Get action masks needed for logging
@@ -398,39 +402,48 @@ def run_forward_pass(
         # Get last layer hidden states
         multi_layer_hidden_states = []
         
-        # Optionally use raw VGGT features as task conditioning for the action head
-        vggt_task_states = None
-        vggt_num_task = None
-        if cfg is not None and cfg.use_vggt and vggt_projector is not None and hasattr(vla.module, '_vggt_raw_cache') and vla.module._vggt_raw_cache is not None:
-            vggt_tokens_list, vggt_patch_start = vla.module._vggt_raw_cache
-            vggt_task_layers = []
-            for vggt_layer in vggt_tokens_list:
-                vggt_patches = vggt_layer.squeeze(1)[:, vggt_patch_start:]                # [B, N_patches, 2048]
-                vggt_projected = vggt_projector.module(vggt_patches.to(torch.bfloat16))    # [B, N_patches, llm_dim]
-                vggt_task_layers.append(vggt_projected.unsqueeze(1))                       # [B, 1, N_patches, llm_dim]
-            vggt_task_states = torch.cat(vggt_task_layers, dim=1)                          # [B, num_vggt_layers, N_patches, llm_dim]
-            vggt_num_task = vggt_task_states.shape[2]
 
-        num_vggt_layers = vggt_task_states.shape[1] if vggt_task_states is not None else 0
-        
+        vggt_query_features = None
+        vggt_num_task = None
+
+        if cfg.use_vggt and vggt_query_module is not None and vla.module._vggt_raw_cache is not None:
+            vggt_tokens_list, vggt_patch_start = vla.module._vggt_raw_cache
+
+            vggt_query_features = vggt_query_module.module(
+                [layer.to(torch.bfloat16) for layer in vggt_tokens_list],
+                vggt_patch_start
+            )
+    
+            vggt_num_task = vggt_query_features.shape[2]  # 64
+
+        num_vggt_layers = vggt_query_features.shape[1] if vggt_query_features is not None else 0
+
+        batch_size = batch["input_ids"].shape[0]
+        drop_mask = None
+        if cfg.use_vggt and vggt_query_features is not None and cfg.gradient_warmup_steps > 0:
+            #drop_prob = min(gradient_step_idx / cfg.gradient_warmup_steps, 1.0) * 0.3
+            drop_mask = (torch.rand(batch_size) < 0.3).to(vggt_query_features.device)
+
         for layer_idx, item in enumerate(output.hidden_states[0:]):
             # last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
             # Get hidden states for text portion of prompt+response (after the vision patches)
             text_hidden_states = item[:, num_patches:-1]
             # Get hidden states for action portion of response
-            batch_size = batch["input_ids"].shape[0]
 
             actions_hidden_states = text_hidden_states[current_action_mask | next_actions_mask].reshape(batch_size, 1,NUM_TOKENS, -1).to(torch.bfloat16)
+            if drop_mask is not None:
+                mask = drop_mask[:, None, None, None].to(actions_hidden_states.dtype)
+                actions_hidden_states = actions_hidden_states * (1 - mask)
 
-            if vggt_task_states is not None:
+            # The VGGT query features are now layer-agnostic (already aggregated),
+            # so just use them the same way at every VLM hidden state layer:
+            if vggt_query_features is not None:
                 vggt_idx = min(layer_idx, num_vggt_layers - 1)
-                vggt_cond = vggt_task_states[:, vggt_idx:vggt_idx+1, :, :]
-                vlm_cond = item[:, :num_patches].reshape(batch_size, 1, num_patches, -1)
-                task_latten_states = torch.cat([vlm_cond, vggt_cond], dim=2)
+                task_latten_states = vggt_query_features[:, vggt_idx:vggt_idx+1, :, :]  # [B, 1, 64, llm_dim]
             else:
-                task_latten_states = item[:, :num_patches].reshape(batch_size, 1, num_patches , -1)
+                task_latten_states = item[:, :num_patches].reshape(batch_size, 1, num_patches, -1)
 
-            all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
+            all_hidden_states = torch.cat((task_latten_states, actions_hidden_states), 2)
             multi_layer_hidden_states.append(all_hidden_states)
 
         multi_layer_hidden_states = torch.cat(multi_layer_hidden_states, dim = 1)
@@ -531,7 +544,7 @@ def save_training_checkpoint(
     train_dataset,
     distributed_state,
     new_state_dict,
-    vggt_projector=None, 
+    vggt_query_module=None, 
     
 ) -> None:
     """
@@ -600,8 +613,8 @@ def save_training_checkpoint(
                 vla.module.vision_backbone.state_dict(), checkpoint_dir / f"vision_backbone--{checkpoint_name_suffix}"
             )
 
-        if cfg.use_vggt and vggt_projector is not None:
-            torch.save(vggt_projector.state_dict(), checkpoint_dir / f"vggt_projector--{checkpoint_name_suffix}")
+        if cfg.use_vggt and vggt_query_module is not None:
+            torch.save(vggt_query_module.state_dict(), checkpoint_dir / f"vggt_query_module--{checkpoint_name_suffix}")
 
     # Wait for model components to be saved
     dist.barrier()
@@ -682,7 +695,7 @@ def run_validation(
                 vla=vla,
                 action_head=action_head,
                 proprio_projector=proprio_projector,
-                vggt_projector=vggt_projector if cfg.use_vggt else None,
+                vggt_query_module=vggt_query_module if cfg.use_vggt else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -896,25 +909,30 @@ def finetune(cfg: FinetuneConfig) -> None:
     
     if cfg.use_vggt:
         from vggt.models.vggt import VGGT
-        from prismatic.extern.hf.modeling_prismatic import VGGTProjector
-        # Get the underlying model (works whether LoRA is on or off)
+        from vggt.vggt_action_queries import VGGTActionQueryModule  # <-- new import
+        
         base_vla = vla.base_model.model if cfg.use_lora else vla
         base_vla.vggt = VGGT.from_pretrained("facebook/vggt-1b").to(torch.bfloat16).to(device_id)
         for param in base_vla.vggt.parameters():
             param.requires_grad = False
-        #vla.vggt.aggregator = torch.compile(vla.vggt.aggregator)
-        vggt_projector = init_module(
-            VGGTProjector,
-            "vggt_projector",
+
+        # Replace VGGTProjector with VGGTActionQueryModule
+        vggt_query_module = init_module(
+            VGGTActionQueryModule,
+            "vggt_query_module",
             cfg,
             device_id,
-            {"vggt_dim": 2048, "llm_dim": base_vla.llm_dim},
+            {
+                "num_queries": 64,
+                "vggt_dim": 2048,
+                "llm_dim": base_vla.llm_dim,
+                "num_layers": 24,   # match VGGT-1B layer count
+                "num_heads": 8,
+            },
             to_bf16=True,
         )
-        #base_vla.vggt_projector = vggt_projector.module
-        print("RUNNING VGGT")
     else:
-        vggt_projector = None
+        vggt_query_module = None
 
     # FiLM setup
     if cfg.use_film:
@@ -976,8 +994,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     if cfg.use_proprio:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
 
-    if cfg.use_vggt and vggt_projector is not None:
-        trainable_params += [p for p in vggt_projector.parameters() if p.requires_grad]
+    if cfg.use_vggt and vggt_query_module is not None:
+        trainable_params += [p for p in vggt_query_module.parameters() if p.requires_grad]
 
     print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
     optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
@@ -1099,7 +1117,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 vla=vla,
                 action_head=action_head,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
-                vggt_projector=vggt_projector if cfg.use_vggt else None,
+                vggt_query_module=vggt_query_module if cfg.use_vggt else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -1110,6 +1128,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 compute_diffusion_l1=compute_diffusion_l1,
                 use_pro_version=cfg.use_pro_version,
                 cfg=cfg,
+                gradient_step_idx=batch_idx // cfg.grad_accumulation_steps,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1151,6 +1170,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                     step=log_step,
                 )
 
+            '''if cfg.action_head_freeze_steps > 0 and gradient_step_idx < cfg.action_head_freeze_steps:
+                for p in action_head.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()'''
+
             # Optimizer and LR scheduler step
             if (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 optimizer.step()
@@ -1172,7 +1196,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                     train_dataset=train_dataset,
                     distributed_state=distributed_state,
                     new_state_dict=RAW_STATE_DICT,
-                    vggt_projector=vggt_projector if cfg.use_vggt else None,
+                    vggt_query_module=vggt_query_module if cfg.use_vggt else None,
                 )
 
             # Test model on validation set

@@ -151,26 +151,37 @@ def initialize_model(cfg: GenerateConfig):
     model = get_model(cfg)
     model.set_version(cfg.save_version)
 
-    # Load VGGT + projector
+    # Load VGGT + query module
+    vggt_query_module = None
     if cfg.use_vggt:
         from vggt.models.vggt import VGGT
-        from prismatic.extern.hf.modeling_prismatic import VGGTProjector
+        from vggt.vggt_action_queries import VGGTActionQueryModule
         from experiments.robot.openvla_utils import find_checkpoint_file, load_component_state_dict
- 
+
         # Attach frozen VGGT backbone
         model.vggt = VGGT.from_pretrained("facebook/vggt-1b").to(torch.bfloat16).to("cuda")
         model.vggt.eval()
         for p in model.vggt.parameters():
             p.requires_grad = False
- 
-        # Load and attach VGGT projector
-        vggt_proj = VGGTProjector(vggt_dim=2048, llm_dim=model.llm_dim).to(torch.bfloat16).to("cuda")
-        proj_ckpt_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vggt_projector")
-        state_dict = load_component_state_dict(proj_ckpt_path)
-        vggt_proj.load_state_dict(state_dict)
-        vggt_proj.eval()
-        model.vggt_projector = vggt_proj
-        logger.info(f"Loaded VGGT projector from {proj_ckpt_path}")
+
+        # Load VGGTActionQueryModule (matches training architecture)
+        vggt_query_module = VGGTActionQueryModule(
+            num_queries=64,
+            vggt_dim=2048,
+            llm_dim=model.llm_dim,
+            num_layers=24,
+            num_heads=8,
+        ).to(torch.bfloat16).to("cuda")
+
+        ckpt_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vggt_query_module")
+        state_dict = load_component_state_dict(ckpt_path)
+
+        # Strip "module." prefix from DDP-saved state dict
+        cleaned = {k.removeprefix("module."): v for k, v in state_dict.items()}
+        vggt_query_module.load_state_dict(cleaned)
+
+        vggt_query_module.eval()
+        logger.info(f"Loaded VGGTActionQueryModule from {ckpt_path}")
 
         
     # Load proprio projector if needed
@@ -196,7 +207,7 @@ def initialize_model(cfg: GenerateConfig):
         processor = get_processor(cfg)
         check_unnorm_key(cfg, model)
 
-    return model, action_head, proprio_projector, noisy_action_projector, processor
+    return model, action_head, proprio_projector, noisy_action_projector, processor, vggt_query_module
 
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
@@ -316,6 +327,7 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    vggt_query_module=None, 
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -366,7 +378,8 @@ def run_episode(
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
-                    use_minivlm=cfg.use_minivlm
+                    use_minivlm=cfg.use_minivlm,
+                    vggt_query_module=vggt_query_module, 
                 )
 
                 action_queue.extend(actions) 
@@ -407,7 +420,8 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
-    save_version=None
+    save_version=None,
+    vggt_query_module=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -457,6 +471,7 @@ def run_task(
             noisy_action_projector,
             initial_state,
             log_file,
+            vggt_query_module=vggt_query_module,
         )
 
         # Update counters
@@ -510,7 +525,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
     set_seed_everywhere(cfg.seed)
 
     # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+    model, action_head, proprio_projector, noisy_action_projector, processor, vggt_query_module = initialize_model(cfg)
 
     # for name, param in model.named_parameters():
     #     if 'action_queries' in name: 
@@ -545,7 +560,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
-            cfg.save_version
+            cfg.save_version,
+            vggt_query_module=vggt_query_module,
         )
 
     # Calculate final success rate
