@@ -831,6 +831,14 @@ def get_vla_action(
         vggt_pixel_values = None
         if hasattr(vla, 'vggt') and getattr(cfg, 'use_vggt', False):
             vggt_pixel_values = _preprocess_image_for_vggt(obs["full_image"])
+
+        # VGGT forward (mirrors finetune.py:350-381)
+        vggt_query_features = None
+        if cfg.use_vggt and vggt_query_module is not None and hasattr(vla, "vggt"):
+            vggt_input = vggt_pixel_values.unsqueeze(1)  # [1,1,3,224,224]
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                vggt_tokens_list, patch_start_idx = vla.vggt.aggregator(vggt_input)
+                vggt_query_features = vggt_query_module(vggt_tokens_list, patch_start_idx)
         
         # Generate action
         if action_head is None:
@@ -847,8 +855,7 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
-                vggt_pixel_values=vggt_pixel_values,
-                vggt_query_module=vggt_query_module,
+                vggt_query_features=vggt_query_features,
             )
 
     # Extract subset of actions for open loop steps

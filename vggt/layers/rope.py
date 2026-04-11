@@ -36,6 +36,7 @@ class PositionGetter:
         """Initializes the position generator with an empty cache."""
         self.position_cache: Dict[Tuple[int, int], torch.Tensor] = {}
 
+    @torch.compiler.disable
     def __call__(self, batch_size: int, height: int, width: int, device: torch.device) -> torch.Tensor:
         """Generates spatial positions for a batch of patches.
 
@@ -151,6 +152,7 @@ class RotaryPositionEmbedding2D(nn.Module):
         # Apply rotation
         return (tokens * cos) + (self._rotate_features(tokens) * sin)
 
+    @torch.compiler.disable
     def forward(self, tokens: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         """Applies 2D rotary position embeddings to input tokens.
 

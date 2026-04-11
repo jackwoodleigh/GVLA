@@ -237,6 +237,20 @@ class PrismaticVisionBackbone(nn.Module):
             return torch.cat(all_patches, dim=1)
 
 
+class VGGTProjector(nn.Module):
+    def __init__(self, vggt_dim: int, llm_dim: int) -> None:
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.LayerNorm(vggt_dim),
+            nn.Linear(vggt_dim, llm_dim),
+            nn.GELU(),
+            nn.Linear(llm_dim, llm_dim),
+        )
+
+    def forward(self, vggt_tokens: torch.Tensor) -> torch.Tensor:
+        # vggt_tokens: [B, N_patches, 2048] -> [B, N_patches, llm_dim]
+        return self.proj(vggt_tokens)
+
 
 # === Prismatic Projector (nn.Module) Definitions ===
 class PrismaticProjector(nn.Module):
@@ -541,6 +555,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        vggt_pixel_values=None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -612,7 +627,15 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             )  # (B, lang_seq_len, llm_dim)
 
             # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            if hasattr(self, 'vggt') and vggt_pixel_values is not None:
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    vggt_tokens_list, patch_start_idx = self.vggt.aggregator(vggt_pixel_values.unsqueeze(1))
+                self._vggt_raw_cache = (vggt_tokens_list, patch_start_idx)
+                projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+            else:
+                self._vggt_raw_cache = None
+                projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
 
             # Process action embeddings
             if noisy_actions is not None:
@@ -817,7 +840,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         proprio=None,
         proprio_projector=None,
-        vggt_query_features=None,
+        vggt_query_module=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
 
@@ -847,8 +870,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Extract hidden states for action tokens
         multi_layer_hidden_states = []
+
+        vggt_query_features = None
+        vggt_num_task = None
+        if self._vggt_raw_cache is not None and action_head is not None:
+            vggt_tokens_list, vggt_patch_start = self._vggt_raw_cache
+            # Handle both DDP-wrapped (training) and bare (eval) module
+            module_fn = vggt_query_module.module if hasattr(vggt_query_module, 'module') else vggt_query_module
+            vggt_query_features = module_fn(vggt_tokens_list, vggt_patch_start)
+            vggt_num_task = vggt_query_features.shape[2]
+
+        num_vggt_layers = vggt_query_features.shape[1] if vggt_query_features is not None else 0
+
         
-        for item in language_model_output.hidden_states[0:]:
+        for layer_idx, item in enumerate(language_model_output.hidden_states[0:]):
             # last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
             # Get hidden states for text portion of prompt+response (after the vision patches)
             text_hidden_states = item
@@ -857,10 +892,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             
             batch_size = item.shape[0]
             if vggt_query_features is not None:
-                vggt_idx = min(len(multi_layer_hidden_states), vggt_query_features.shape[1] - 1)
+                vggt_idx = min(layer_idx, num_vggt_layers - 1)
                 task_latten_states = vggt_query_features[:, vggt_idx:vggt_idx+1, :, :]
             else:
                 task_latten_states = item[:, :NUM_PATCHES].reshape(batch_size, 1, NUM_PATCHES, -1)
+            
             all_hidden_states = torch.cat((task_latten_states, actions_hidden_states),2)
             multi_layer_hidden_states.append(all_hidden_states)
             
@@ -873,7 +909,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = action_head.predict_action(multi_layer_hidden_states,
                                                 proprio=proprio,
                                                 proprio_projector=proprio_projector,
-                                                num_task_tokens=vggt_query_features.shape[2] if vggt_query_features is not None else None,
+                                                num_task_tokens=vggt_num_task
                                                 )
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
@@ -925,7 +961,6 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         pixel_values = kwargs["pixel_values"] # [1, 12, 224, 224]
         attention_mask = kwargs["attention_mask"] # 
-        vggt_query_features = kwargs.get("vggt_query_features", None)
 
         # Create fake labels tensor (needed for action mask)
         labels = input_ids.clone()
@@ -950,7 +985,16 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         )
 
         # Process vision features
-        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        if hasattr(self, 'vggt') and 'vggt_pixel_values' in kwargs and kwargs['vggt_pixel_values'] is not None:
+            vggt_pixel_values = kwargs['vggt_pixel_values']
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                vggt_tokens_list, patch_start_idx = self.vggt.aggregator(vggt_pixel_values.unsqueeze(1))
+            self._vggt_raw_cache = (vggt_tokens_list, patch_start_idx)
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        else:
+            self._vggt_raw_cache = None
+            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -972,7 +1016,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_head=action_head,
             proprio=proprio, # [8]
             proprio_projector=proprio_projector,
-            vggt_query_features=vggt_query_features
+            vggt_query_module=kwargs.get('vggt_query_module', None),
             )
            
         # Unnormalize predicted actions

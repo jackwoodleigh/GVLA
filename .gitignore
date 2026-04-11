@@ -162,3 +162,4 @@ pretrained_models/
 *.safetensors
 *.back.*
 run.txt
+.Identifier

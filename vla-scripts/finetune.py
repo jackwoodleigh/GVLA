@@ -60,9 +60,16 @@ from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.models import load, load_vla
 
 
+import random
+import numpy as np
 
 # Sane Defaults
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+torch.manual_seed(42)
+torch.cuda.manual_seed_all(42)
+
+random.seed(42)
+np.random.seed(42)
 
 @dataclass
 class FinetuneConfig:
@@ -292,6 +299,7 @@ def run_forward_pass(
     vla,
     action_head,
     proprio_projector,
+    vggt,
     vggt_query_module, 
     batch,
     action_tokenizer,
@@ -303,7 +311,8 @@ def run_forward_pass(
     compute_diffusion_l1=False,
     use_pro_version=True,
     cfg=None,
-    gradient_step_idx=None
+    gradient_step_idx=None,
+    vggt_stream=None
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -335,14 +344,22 @@ def run_forward_pass(
     # Get ground-truth action labels
     ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
     noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
+    
+    # VGGT forward pass (streams)
+    
+    if cfg.use_vggt and vggt_query_module is not None:
+        with torch.cuda.stream(vggt_stream):
+            vggt_input = batch["vggt_pixel_values"].to(device_id, dtype=torch.bfloat16).unsqueeze(1)
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                vggt_tokens_list, patch_start_idx = vggt.aggregator(vggt_input)
+    
 
     # VLA forward pass
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output: CausalLMOutputWithPast = vla(
-            input_ids=batch["input_ids"].to(device_id),
-            attention_mask=batch["attention_mask"].to(device_id),
-            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
-            vggt_pixel_values=batch["vggt_pixel_values"].to(torch.bfloat16).to(device_id) if cfg.use_vggt else None,
+            input_ids=batch["input_ids"].to(device_id, non_blocking=True),
+            attention_mask=batch["attention_mask"].to(device_id, non_blocking=True),
+            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id, non_blocking=True),
             labels=batch["labels"],
             output_hidden_states=True,
             proprio=batch["proprio"] if use_proprio else None,
@@ -351,8 +368,17 @@ def run_forward_pass(
             noisy_action_projector=None,
             diffusion_timestep_embeddings=None,
             use_film=use_film,
-            
             )
+
+    # VGGT forward pass
+    vggt_query_features = None
+    vggt_num_task = None 
+    if cfg.use_vggt and vggt_query_module is not None:
+        torch.cuda.current_stream().wait_stream(vggt_stream)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            vggt_query_features = vggt_query_module(vggt_tokens_list, patch_start_idx)
+        vggt_num_task = vggt_query_features.shape[2] 
+        num_vggt_layers = vggt_query_features.shape[1]
 
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:,1:].to(device_id)
@@ -402,22 +428,6 @@ def run_forward_pass(
         # Get last layer hidden states
         multi_layer_hidden_states = []
         
-
-        vggt_query_features = None
-        vggt_num_task = None
-
-        if cfg.use_vggt and vggt_query_module is not None and vla.module._vggt_raw_cache is not None:
-            vggt_tokens_list, vggt_patch_start = vla.module._vggt_raw_cache
-
-            vggt_query_features = vggt_query_module.module(
-                [layer.to(torch.bfloat16) for layer in vggt_tokens_list],
-                vggt_patch_start
-            )
-    
-            vggt_num_task = vggt_query_features.shape[2]  # 64
-
-        num_vggt_layers = vggt_query_features.shape[1] if vggt_query_features is not None else 0
-
         batch_size = batch["input_ids"].shape[0]
         drop_mask = None
         if cfg.use_vggt and vggt_query_features is not None and cfg.gradient_warmup_steps > 0:
@@ -652,6 +662,8 @@ def run_validation(
     action_head,
     noisy_action_projector,
     proprio_projector,
+    vggt,
+    vggt_query_module, 
     val_dataloader,
     action_tokenizer,
     device_id,
@@ -696,6 +708,7 @@ def run_validation(
                 action_head=action_head,
                 proprio_projector=proprio_projector,
                 vggt_query_module=vggt_query_module if cfg.use_vggt else None,
+                vggt=vggt if cfg.use_vggt else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
                 device_id=device_id,
@@ -774,7 +787,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Initialize wandb logging
     if distributed_state.is_main_process:
-        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", mode="online")
+        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", config=vars(cfg), mode="online")
 
     # Print detected constants
     print(
@@ -870,19 +883,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             trust_remote_code=False,
             ).to(device_id)
     
-    # Patch processor with VGGT normalization if needed
-    '''if cfg.use_vggt:
-        from torchvision.transforms import InterpolationMode
-        VGGT_SIZE = 224
-        ip = processor.image_processor
-        ip.input_sizes.append((3, VGGT_SIZE, VGGT_SIZE))
-        ip.means.append((0.0, 0.0, 0.0))
-        ip.stds.append((1.0, 1.0, 1.0))
-        ip.tvf_resize_params.append({"size": VGGT_SIZE, "interpolation": InterpolationMode.BICUBIC, "max_size": None, "antialias": True})
-        ip.tvf_crop_params.append({"output_size": (VGGT_SIZE, VGGT_SIZE)})
-        ip.tvf_normalize_params.append({"mean": [0.0, 0.0, 0.0], "std": [1.0, 1.0, 1.0], "inplace": False})'''
-
-
+    
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
@@ -907,33 +908,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             if "action_queries" in name:
                 param.requires_grad = True
     
-    if cfg.use_vggt:
-        from vggt.models.vggt import VGGT
-        from vggt.vggt_action_queries import VGGTActionQueryModule  # <-- new import
-        
-        base_vla = vla.base_model.model if cfg.use_lora else vla
-        base_vla.vggt = VGGT.from_pretrained("facebook/vggt-1b").to(torch.bfloat16).to(device_id)
-        for param in base_vla.vggt.parameters():
-            param.requires_grad = False
-
-        # Replace VGGTProjector with VGGTActionQueryModule
-        vggt_query_module = init_module(
-            VGGTActionQueryModule,
-            "vggt_query_module",
-            cfg,
-            device_id,
-            {
-                "num_queries": 64,
-                "vggt_dim": 2048,
-                "llm_dim": base_vla.llm_dim,
-                "num_layers": 24,   # match VGGT-1B layer count
-                "num_heads": 8,
-            },
-            to_bf16=True,
-        )
-    else:
-        vggt_query_module = None
-
+    
     # FiLM setup
     if cfg.use_film:
         count_parameters(vla.vision_backbone, "vla.vision_backbone (original)")
@@ -953,6 +928,38 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # Wrap VLA with DDP
     vla = wrap_ddp(vla, device_id, find_unused=True)
+
+    if cfg.use_vggt:
+        from vggt.models.vggt import VGGT
+        from vggt.vggt_action_queries import VGGTActionQueryModule  # <-- new import
+        vggt = VGGT.from_pretrained("facebook/vggt-1b").to(torch.bfloat16).to(device_id)
+        vggt.eval()
+        for param in vggt.parameters():
+            param.requires_grad = False
+
+        vggt.aggregator = torch.compile(vggt.aggregator, mode="reduce-overhead")
+        vggt_stream = torch.cuda.Stream()
+
+        llm_dim = vla.module.llm_dim #vla.base_model.model.llm_dim if cfg.use_lora else vla.llm_dim
+        vggt_query_module = init_module(
+            VGGTActionQueryModule,
+            "vggt_query_module",
+            cfg,
+            device_id,
+            {
+                "num_queries": 64,
+                "vggt_dim": 2048,
+                "llm_dim": llm_dim,
+                "num_layers": 24,   
+                "num_heads": 8,
+            },
+            to_bf16=True,
+        )
+    else:
+        vggt_query_module = None
+        vggt = None
+        vggt_stream = None
+
 
     # If applicable, instantiate proprio projector
     if cfg.use_proprio:
@@ -995,27 +1002,42 @@ def finetune(cfg: FinetuneConfig) -> None:
         trainable_params += [param for param in proprio_projector.parameters() if param.requires_grad]
 
     if cfg.use_vggt and vggt_query_module is not None:
-        trainable_params += [p for p in vggt_query_module.parameters() if p.requires_grad]
-
-    print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
-    optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
+        vggt_params = [p for p in vggt_query_module.parameters() if p.requires_grad]
+        print(f"# total trainable params: {sum(p.numel() for p in trainable_params) + sum(p.numel() for p in vggt_params)}")
+        optimizer = AdamW([
+            {"params": trainable_params},
+            {"params": vggt_params, "lr": cfg.learning_rate},
+        ], lr=cfg.learning_rate)
+    else:
+        print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
+        optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
     # Record original learning rate
     original_lr = optimizer.param_groups[0]["lr"]
 
     # Create learning rate scheduler
     # 1. MultiStepLR
-    scheduler = MultiStepLR(
+    '''scheduler = MultiStepLR(
         optimizer,
         milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
         gamma=0.1,  # Multiplicative factor of learning rate decay
-    )
+    )'''
     # 2. CosineAnnealingLR
     # scheduler = CosineAnnealingLR(
     #         optimizer,
     #         T_max=cfg.num_steps_before_decay, 
     #         eta_min=0.0001,          
     #         )
+
+    # Cosine annealing with linear warmup (VLA-Adapter spec)
+    warmup_steps = int(cfg.lr_warmup_steps * cfg.max_steps) if cfg.lr_warmup_steps < 1 else cfg.lr_warmup_steps
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return 0.1 + 0.9 * (step / warmup_steps)         
+        progress = (step - warmup_steps) / max(1, cfg.max_steps - warmup_steps)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))     
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
@@ -1107,8 +1129,6 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Start training
     with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
         vla.train()
-        if cfg.use_vggt:
-            vla.module.vggt.eval()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
             # Compute training metrics and loss
@@ -1117,6 +1137,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 vla=vla,
                 action_head=action_head,
                 proprio_projector=proprio_projector if cfg.use_proprio else None,
+                vggt=vggt if cfg.use_vggt else None,
                 vggt_query_module=vggt_query_module if cfg.use_vggt else None,
                 batch=batch,
                 action_tokenizer=action_tokenizer,
@@ -1129,6 +1150,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 use_pro_version=cfg.use_pro_version,
                 cfg=cfg,
                 gradient_step_idx=batch_idx // cfg.grad_accumulation_steps,
+                vggt_stream=vggt_stream, 
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1154,11 +1176,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 
             # [If applicable] Linearly warm up learning rate from 10% to 100% of original
-            if cfg.lr_warmup_steps > 0:
+            '''if cfg.lr_warmup_steps > 0:
                 lr_progress = min((gradient_step_idx + 1) / cfg.lr_warmup_steps, 1.0)  # Cap at 1.0
                 current_lr = original_lr * (0.1 + 0.9 * lr_progress)
                 for param_group in optimizer.param_groups:
-                    param_group["lr"] = current_lr
+                    param_group["lr"] = current_lr'''
 
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
                 # Log the learning rate
@@ -1217,8 +1239,6 @@ def finetune(cfg: FinetuneConfig) -> None:
                 )
                 # Set model back to training mode after validation
                 vla.train()
-                if cfg.use_vggt:
-                    vla.module.vggt.eval()
 
             # Stop training when max_steps is reached
             if log_step == cfg.max_steps:
