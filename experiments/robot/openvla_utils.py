@@ -845,6 +845,15 @@ def get_vla_action(
             # Standard VLA output (single-image inputs, discrete actions)
             action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
         else:
+            # Optionally drop VLM image embeddings (mirrors finetune_chained.py per-sample image_drop).
+            # Only applied on the action-head + VGGT path, where VGGT provides task tokens that can
+            # carry the policy when the VLM patches are zeroed.
+            image_drop_mask = None
+            image_drop_p = float(getattr(cfg, "image_drop", 0.0) or 0.0)
+            if image_drop_p > 0.0 and getattr(cfg, "use_vggt", False) and vggt_query_features is not None:
+                batch_size = inputs["input_ids"].shape[0]
+                image_drop_mask = (torch.rand(batch_size, device=DEVICE) < image_drop_p)
+
             # Custom action head for continuous actions
             action, _ = vla.predict_action(
                 **inputs,
@@ -856,6 +865,7 @@ def get_vla_action(
                 action_head=action_head,
                 use_film=use_film,
                 vggt_query_features=vggt_query_features,
+                image_drop_mask=image_drop_mask,
             )
 
     # Extract subset of actions for open loop steps

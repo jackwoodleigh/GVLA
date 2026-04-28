@@ -541,6 +541,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        image_drop_mask: Optional[torch.Tensor] = None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -613,6 +614,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
 
             # Get visual features
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
+            if image_drop_mask is not None:
+                keep = (~image_drop_mask).to(projected_patch_embeddings.dtype)
+                projected_patch_embeddings = projected_patch_embeddings * keep[:, None, None]
 
             # Process action embeddings
             if noisy_actions is not None:
@@ -951,6 +956,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
 
         # Process vision features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
+        # Optionally zero VLM image embeddings (mirrors training-time image_drop in finetune_chained.py)
+        image_drop_mask = kwargs.get("image_drop_mask", None)
+        if image_drop_mask is not None:
+            keep = (~image_drop_mask).to(projected_patch_embeddings.dtype)
+            projected_patch_embeddings = projected_patch_embeddings * keep[:, None, None]
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None

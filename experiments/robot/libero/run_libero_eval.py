@@ -32,10 +32,13 @@ from experiments.robot.libero.libero_utils import (
     save_rollout_video,
 )
 from experiments.robot.openvla_utils import (
+    _load_dataset_stats,
+    find_checkpoint_file,
     get_action_head,
     get_noisy_action_projector,
     get_processor,
     get_proprio_projector,
+    load_component_state_dict,
     resize_image_for_policy,
 )
 from experiments.robot.robot_utils import (
@@ -124,10 +127,19 @@ class GenerateConfig:
     seed: int = 7                                    # Random Seed (for reproducibility)
 
     # fmt: on
-    save_version: str = "vla-adapter"                # version of 
+    save_version: str = "vla-adapter"                # version of
     use_pro_version: bool = True                     # encourage to use the pro models we released.
     phase: str = "Inference"
     use_vggt: bool = False
+    image_drop: float = 0.0                          # Per-query probability of zeroing the VLM image embeddings
+                                                     #   (mirrors `image_drop` in finetune_chained.py)
+
+    # Unmerged-LoRA checkpoint support (for checkpoints produced with merge_lora_during_training=False)
+    unmerged_checkpoint: bool = False                # If True, rebuild base VLA and merge LoRA adapter in memory
+    vlm_path: str = "openvla/openvla-7b"             # Base VLM path (used when unmerged_checkpoint and use_minivlm)
+    config_file_path: str = ""                       # Base-model config/checkpoint path used to construct the base VLA
+                                                     #   - use_minivlm=True  -> path to minivlm config.json (e.g. pretrained_models/configs/config.json)
+                                                     #   - use_minivlm=False -> path to base OpenVLA checkpoint dir
 
 
 
@@ -145,10 +157,106 @@ def validate_config(cfg: GenerateConfig) -> None:
 
 
 
+def load_unmerged_vla(cfg: GenerateConfig):
+    """Rebuild base VLA, attach LoRA adapter, merge in memory, and load trained action_queries.
+
+    Mirrors the offline-merge block in vla-scripts/finetune_chained.py (the
+    `merge_lora_during_training` path). Use when the checkpoint directory contains
+    `lora_adapter/` + component .pt files but no merged base-model weights.
+    """
+    import gc
+
+    from peft import PeftModel
+    from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
+
+    from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
+    from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
+    from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
+
+    AutoConfig.register("openvla", OpenVLAConfig)
+    AutoImageProcessor.register(OpenVLAConfig, PrismaticImageProcessor)
+    AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
+    AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
+
+    adapter_dir = os.path.join(cfg.pretrained_checkpoint, "lora_adapter")
+    assert os.path.isdir(adapter_dir), f"Expected LoRA adapter at {adapter_dir}"
+    assert cfg.config_file_path, (
+        "unmerged_checkpoint requires --config_file_path "
+        "(minivlm config.json, or base OpenVLA checkpoint dir)"
+    )
+
+    if cfg.use_minivlm:
+        from prismatic.models import load, load_vla
+
+        config = AutoConfig.from_pretrained(cfg.config_file_path)
+        base_vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16)
+
+        if "prism-qwen25-extra-dinosiglip-224px-0_5b" in cfg.vlm_path:
+            vlm = load(cfg.vlm_path, hf_token="", load_for_training=True)
+        else:
+            vlm = load_vla(cfg.vlm_path, hf_token="", load_for_training=True)
+
+        replace_map = [
+            ("vision_backbone.dino_featurizer", "vision_backbone.featurizer"),
+            ("vision_backbone.siglip_featurizer", "vision_backbone.fused_featurizer"),
+            ("llm_backbone.llm", "language_model"),
+            ("projector.projector.0", "projector.fc1"),
+            ("projector.projector.2", "projector.fc2"),
+            ("projector.projector.4", "projector.fc3"),
+            ("gamma", "scale_factor"),
+        ]
+        renamed = {}
+        for k, v in vlm.state_dict().items():
+            new_k = k
+            for old, new in replace_map:
+                if old in new_k:
+                    new_k = new_k.replace(old, new)
+            renamed[new_k] = v
+        base_vla.load_state_dict(renamed, strict=False)
+        del vlm, renamed
+        gc.collect()
+    else:
+        base_vla = AutoModelForVision2Seq.from_pretrained(
+            cfg.config_file_path,
+            torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True,
+            trust_remote_code=False,
+        )
+
+    merged = PeftModel.from_pretrained(base_vla, adapter_dir)
+    merged = merged.merge_and_unload()
+
+    # action_queries is saved outside the PEFT adapter, so restore it after merge
+    aq_path = find_checkpoint_file(cfg.pretrained_checkpoint, "action_queries")
+    aq_sd = load_component_state_dict(aq_path)
+    merged.action_queries.load_state_dict(aq_sd)
+
+    if cfg.use_film:
+        from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
+
+        merged.vision_backbone = FiLMedPrismaticVisionBackbone(
+            vision_backbone=merged.vision_backbone, llm_dim=merged.llm_dim,
+        )
+        vb_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vision_backbone")
+        merged.vision_backbone.load_state_dict(torch.load(vb_path, weights_only=True))
+        merged.vision_backbone = merged.vision_backbone.to(torch.bfloat16)
+
+    merged.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
+    merged.eval()
+    merged = merged.to("cuda")
+
+    _load_dataset_stats(merged, cfg.pretrained_checkpoint)
+
+    return merged
+
+
 def initialize_model(cfg: GenerateConfig):
     """Initialize model and associated components."""
     # Load model
-    model = get_model(cfg)
+    if cfg.unmerged_checkpoint:
+        model = load_unmerged_vla(cfg)
+    else:
+        model = get_model(cfg)
     model.set_version(cfg.save_version)
 
     # Load VGGT + query module
@@ -166,11 +274,7 @@ def initialize_model(cfg: GenerateConfig):
 
         # Load VGGTActionQueryModule (matches training architecture)
         vggt_query_module = VGGTActionQueryModule(
-            num_queries=64,
-            vggt_dim=2048,
             llm_dim=model.llm_dim,
-            num_layers=24,
-            num_heads=8,
         ).to(torch.bfloat16).to("cuda")
 
         ckpt_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vggt_query_module")

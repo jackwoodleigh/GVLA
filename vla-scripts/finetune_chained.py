@@ -27,6 +27,7 @@ from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq,
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import wandb
 import math
+import sys
 
 from experiments.robot.openvla_utils import (
     check_model_logic_mismatch,
@@ -59,7 +60,9 @@ from prismatic.vla.datasets import RLDSDataset, RLDSBatchTransform
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics
 from prismatic.models import load, load_vla
 
-
+import gc
+import json
+import shutil
 import random
 import numpy as np
 
@@ -93,7 +96,8 @@ class FinetuneConfig:
     num_images_in_input: int = 1                     # Number of images in the VLA input (default: 1)
     use_proprio: bool = False                        # If True, includes robot proprioceptive state in input
     use_vggt: bool = False                           # If True, adds VGGT as an additional vision module with separate normalization
-    gradient_warmup_steps: int = 0
+    modality_drop: float = 0
+    image_drop: float = 0
     phase1_path: str = "None"
 
     # Training configuration
@@ -136,6 +140,9 @@ class FinetuneConfig:
     use_pro_version: bool = True                             # the version number
     phase: str = "Training"
     # fmt: on
+
+    wall_time_limit_seconds: int = 0                 # If > 0, write an emergency checkpoint once wall-clock >= this many seconds
+    resume_from_emergency: bool = False              # If True, deletes the emergency checkpoint dir after a successful load
 
 
 
@@ -355,6 +362,10 @@ def run_forward_pass(
     
 
     # VLA forward pass
+    image_drop_mask = None
+    if vla.training and cfg is not None and cfg.image_drop > 0:
+        image_drop_mask = (torch.rand(batch["input_ids"].shape[0], device=device_id) < cfg.image_drop)
+    
     with torch.autocast("cuda", dtype=torch.bfloat16):
         output: CausalLMOutputWithPast = vla(
             input_ids=batch["input_ids"].to(device_id, non_blocking=True),
@@ -368,6 +379,7 @@ def run_forward_pass(
             noisy_action_projector=None,
             diffusion_timestep_embeddings=None,
             use_film=use_film,
+            image_drop_mask=image_drop_mask
             )
 
     # VGGT forward pass
@@ -430,9 +442,9 @@ def run_forward_pass(
         
         batch_size = batch["input_ids"].shape[0]
         drop_mask = None
-        if cfg.use_vggt and vggt_query_features is not None and cfg.gradient_warmup_steps > 0:
+        if cfg.use_vggt and vggt_query_features is not None and cfg.modality_drop > 0:
             #drop_prob = min(gradient_step_idx / cfg.gradient_warmup_steps, 1.0) * 0.3
-            drop_mask = (torch.rand(batch_size) < 0.1).to(vggt_query_features.device)
+            drop_mask = (torch.rand(batch_size) < cfg.modality_drop).to(vggt_query_features.device)
 
         for layer_idx, item in enumerate(output.hidden_states[0:]):
             # last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
@@ -555,6 +567,9 @@ def save_training_checkpoint(
     distributed_state,
     new_state_dict,
     vggt_query_module=None, 
+    optimizer=None,                  # NEW
+    scheduler=None, 
+    is_emergency: bool = False,
     
 ) -> None:
     """
@@ -576,7 +591,19 @@ def save_training_checkpoint(
         None.
     """
     # Determine checkpoint paths and naming
-    if cfg.save_latest_checkpoint_only:
+    if is_emergency:
+        # Memory-pressure peaks here (VLA + VGGT + AdamW fp32 moments + allocator caches).
+        # Free what we can on every rank before the save to avoid a cgroup OOM kill.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        checkpoint_dir = Path(str(run_dir) + "--emergency_chkpt")
+        checkpoint_name_suffix = f"{log_step}_checkpoint.pt"
+        # Wipe any stale emergency dir before overwriting (main process only; others wait)
+        if distributed_state.is_main_process and checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+        dist.barrier()
+    elif cfg.save_latest_checkpoint_only:
         checkpoint_dir = run_dir
         checkpoint_name_suffix = "latest_checkpoint.pt"
     else:
@@ -626,22 +653,66 @@ def save_training_checkpoint(
         if cfg.use_vggt and vggt_query_module is not None:
             torch.save(vggt_query_module.state_dict(), checkpoint_dir / f"vggt_query_module--{checkpoint_name_suffix}")
 
+
+        aq = vla.state_dict()['module.base_model.model.action_queries.weight'].cpu()
+        torch.save({"weight": aq}, checkpoint_dir / f"action_queries--{checkpoint_name_suffix}")
+        del aq
+        if is_emergency:
+            # Drop the adapter-save temporaries before materializing the full optimizer state dict.
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        if optimizer is not None and scheduler is not None:
+            torch.save(
+                {"optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict()},
+                checkpoint_dir / f"trainer_state--{checkpoint_name_suffix}",
+            )
+
     # Wait for model components to be saved
     dist.barrier()
 
     # Merge LoRA weights into base model and save resulting model checkpoint
     # Note: Can be very slow on some devices; if so, we recommend merging offline
-    if cfg.use_lora and cfg.merge_lora_during_training:
-        if cfg.use_minivlm:
+    if cfg.use_lora and cfg.merge_lora_during_training and not is_emergency:
+        '''if cfg.use_minivlm:
             config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
             base_vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16)  # Create a new model with configuration, the parameters are randomly initialized
             # print(new_state_dict['action_queries.weight'])
             new_state_dict['action_queries.weight'] = vla.state_dict()['module.base_model.model.action_queries.weight'].cpu()
-            missing_keys, unexpected_keys = base_vla.load_state_dict(new_state_dict, strict=False)
+            missing_keys, unexpected_keys = base_vla.load_state_dict(new_state_dict, strict=False)'''
+        if cfg.use_minivlm:
+            config = AutoConfig.from_pretrained("pretrained_models/configs/config.json")
+            base_vla = AutoModelForVision2Seq.from_config(config, torch_dtype=torch.bfloat16)
+            
+            # Reload base VLM weights on demand (they were freed after init to save RAM)
+            from prismatic.models import load
+            vlm_for_merge = load(cfg.vlm_path, hf_token='', load_for_training=True)
+            replace_map = [
+                ("vision_backbone.dino_featurizer", "vision_backbone.featurizer"),
+                ("vision_backbone.siglip_featurizer", "vision_backbone.fused_featurizer"),
+                ("llm_backbone.llm", "language_model"),
+                ("projector.projector.0", "projector.fc1"),
+                ("projector.projector.2", "projector.fc2"),
+                ("projector.projector.4", "projector.fc3"),
+                ("gamma", "scale_factor"),
+            ]
+            local_state_dict = {}
+            for k, v in vlm_for_merge.state_dict().items():
+                new_k = k
+                for old, new in replace_map:
+                    if old in new_k:
+                        new_k = new_k.replace(old, new)
+                local_state_dict[new_k] = v
+            del vlm_for_merge
+            
+            local_state_dict['action_queries.weight'] = vla.state_dict()['module.base_model.model.action_queries.weight'].cpu()
+            missing_keys, unexpected_keys = base_vla.load_state_dict(local_state_dict, strict=False)
+            del local_state_dict
+            gc.collect()
             
         else:
             base_vla = AutoModelForVision2Seq.from_pretrained(
-            cfg.config_file_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=False, trust_remote_code=False
+            cfg.config_file_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=False
         )
 
 
@@ -654,6 +725,11 @@ def save_training_checkpoint(
         
         # Wait for merged model to be saved
         dist.barrier()
+    
+    # For emergency saves, write a tiny meta file so the bash wrapper knows which step to resume from.
+    if is_emergency and distributed_state.is_main_process:
+        with open(checkpoint_dir / "emergency_meta.json", "w") as f:
+            json.dump({"step": int(log_step)}, f)
 
 
 
@@ -744,6 +820,21 @@ def run_validation(
         log_metrics_to_wandb(avg_val_metrics, "VLA Val", log_step, wandb)
 
 
+# --- module-level helper, near the other utility functions ---
+def check_wall_time_limit(
+    training_start_time: float,
+    limit_seconds: int,
+    signal_tensor: torch.Tensor,
+    is_main_process: bool,
+) -> bool:
+    """Rank-coordinated wall-clock check. Main rank reads the clock; result is broadcast to
+    all ranks so collective saves never desync. Caller owns `signal_tensor` (pre-allocated
+    1-element int tensor on the correct device)."""
+    signal_tensor.zero_()
+    if is_main_process and (time.time() - training_start_time) >= limit_seconds:
+        signal_tensor.fill_(1)
+    dist.broadcast(signal_tensor, src=0)
+    return signal_tensor.item() == 1
 
 @draccus.wrap()
 def finetune(cfg: FinetuneConfig) -> None:
@@ -786,8 +877,17 @@ def finetune(cfg: FinetuneConfig) -> None:
     torch.cuda.empty_cache()
 
     # Initialize wandb logging
+    '''if distributed_state.is_main_process:
+        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", config=vars(cfg), mode="online")'''
+
     if distributed_state.is_main_process:
-        wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", config=vars(cfg), mode="online")
+        wandb_id_path = run_dir / "wandb_run_id.txt"
+        if cfg.resume and wandb_id_path.exists():
+            saved_id = wandb_id_path.read_text().strip()
+            wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", id=saved_id, resume="must", config=vars(cfg), mode="online")
+        else:
+            run = wandb.init(project=cfg.wandb_project, name=f"ft+{run_id}", config=vars(cfg), mode="online")
+            wandb_id_path.write_text(run.id)
 
     # Print detected constants
     print(
@@ -822,18 +922,12 @@ def finetune(cfg: FinetuneConfig) -> None:
 
 
     # Update config.json and sync model files
-    import time as _t
-    _t0 = _t.time()
-    _rk = dist.get_rank() if dist.is_initialized() else -1
-    print(f"[rank {_rk}] pre-auto-map t={_t.time()-_t0:.1f}", flush=True)
     if distributed_state.is_main_process:
         update_auto_map(cfg.config_file_path)
-        print(f"[rank 0] update_auto_map done t={_t.time()-_t0:.1f}", flush=True)
         check_model_logic_mismatch(cfg.config_file_path)
-        print(f"[rank 0] check_model_logic_mismatch done t={_t.time()-_t0:.1f}", flush=True)
-    print(f"[rank {_rk}] entering barrier t={_t.time()-_t0:.1f}", flush=True)
+
+    # Wait for model files to be synced
     dist.barrier()
-    print(f"[rank {_rk}] past barrier t={_t.time()-_t0:.1f}", flush=True)
 
     # Load processor and VLA
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
@@ -876,26 +970,49 @@ def finetune(cfg: FinetuneConfig) -> None:
         
         old_state_dict = vlm.state_dict()
         RAW_STATE_DICT = rename_state_dict_keys(old_state_dict, replace_map)
+        if cfg.resume:
+            aq_path = Path(cfg.resum_vla_path) / f"action_queries--{cfg.resume_step}_checkpoint.pt"
+            aq_sd = torch.load(aq_path, weights_only=True, map_location="cpu")
+            vla.action_queries.load_state_dict(aq_sd)  # or .weight.data.copy_(aq_sd["weight"])
     
         missing_keys, unexpected_keys = vla.load_state_dict(RAW_STATE_DICT, strict=False)
-        del old_state_dict
+        del old_state_dict, vlm
+        RAW_STATE_DICT = None
+        import gc; gc.collect()
 
     else:
         RAW_STATE_DICT ={}
         vla = AutoModelForVision2Seq.from_pretrained(
             cfg.config_file_path,
             torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=False,
+            low_cpu_mem_usage=True,
             trust_remote_code=False,
             ).to(device_id)
+        
     
     
     # Set number of images in VLA input
     vla.vision_backbone.set_num_images_in_input(cfg.num_images_in_input)
 
     # vla.set_version(cfg.version)
-
     if cfg.use_lora:
+        lora_config = LoraConfig(
+            r=cfg.lora_rank,
+            lora_alpha=2 * cfg.lora_rank,
+            lora_dropout=cfg.lora_dropout,
+            target_modules="all-linear",
+            init_lora_weights="gaussian",
+        )
+        if cfg.resume:
+            adapter_dir = Path(cfg.resum_vla_path) / "lora_adapter"
+            vla = PeftModel.from_pretrained(vla, str(adapter_dir), is_trainable=True)
+        else:
+            vla = get_peft_model(vla, lora_config)
+        for name, param in vla.named_parameters():
+            if "action_queries" in name:
+                param.requires_grad = True
+        vla.print_trainable_parameters()
+        '''if cfg.use_lora:
         lora_config = LoraConfig(
             r=cfg.lora_rank,
             lora_alpha= 2 * cfg.lora_rank,
@@ -907,7 +1024,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         for name, param in vla.named_parameters():
             if "action_queries" in name:
                 param.requires_grad = True
-        vla.print_trainable_parameters()
+        vla.print_trainable_parameters()'''
 
     else:
         for name, param in vla.named_parameters():
@@ -943,6 +1060,12 @@ def finetune(cfg: FinetuneConfig) -> None:
         for param in vggt.parameters():
             param.requires_grad = False
 
+        for attr in ("depth_head", "point_head", "camera_head", "track_head"):
+            if hasattr(vggt, attr):
+                setattr(vggt, attr, None)
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
+
         vggt.aggregator = torch.compile(vggt.aggregator, mode="reduce-overhead")
         vggt_stream = torch.cuda.Stream()
 
@@ -953,11 +1076,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             cfg,
             device_id,
             {
-                "num_queries": 64,
-                "vggt_dim": 2048,
                 "llm_dim": llm_dim,
-                "num_layers": 24,   
-                "num_heads": 8,
             },
             to_bf16=True,
         )
@@ -997,6 +1116,8 @@ def finetune(cfg: FinetuneConfig) -> None:
     # Get number of vision patches
     NUM_PATCHES = vla.module.vision_backbone.get_num_patches() * vla.module.vision_backbone.get_num_images_in_input()
 
+    
+
     # If we have proprio inputs, a single proprio embedding is appended to the end of the vision patch embeddings
 
     # Instantiate optimizer
@@ -1018,33 +1139,52 @@ def finetune(cfg: FinetuneConfig) -> None:
         print(f"# total trainable params: {sum(p.numel() for p in trainable_params)}")
         optimizer = AdamW(trainable_params, lr=cfg.learning_rate)
 
-    # Record original learning rate
-    original_lr = optimizer.param_groups[0]["lr"]
 
-    # Create learning rate scheduler
-    # 1. MultiStepLR
-    '''scheduler = MultiStepLR(
-        optimizer,
-        milestones=[cfg.num_steps_before_decay],  # Number of steps after which LR will change
-        gamma=0.1,  # Multiplicative factor of learning rate decay
-    )'''
-    # 2. CosineAnnealingLR
-    # scheduler = CosineAnnealingLR(
-    #         optimizer,
-    #         T_max=cfg.num_steps_before_decay, 
-    #         eta_min=0.0001,          
-    #         )
-
-    # Cosine annealing with linear warmup (VLA-Adapter spec)
     warmup_steps = int(cfg.lr_warmup_steps * cfg.max_steps) if cfg.lr_warmup_steps < 1 else cfg.lr_warmup_steps
     def lr_lambda(step):
         if step < warmup_steps:
             return 0.1 + 0.9 * (step / warmup_steps)         
         progress = (step - warmup_steps) / max(1, cfg.max_steps - warmup_steps)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))     
+        return 0.1 + 0.9 * 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    if cfg.resume:
+        trainer_state_path = Path(cfg.resum_vla_path) / f"trainer_state--{cfg.resume_step}_checkpoint.pt"
+        if trainer_state_path.exists():
+            trainer_state = torch.load(trainer_state_path, map_location="cpu", weights_only=False)
+            optimizer.load_state_dict(trainer_state["optimizer"])
+            scheduler.load_state_dict(trainer_state["scheduler"])
+            # Move optimizer state tensors to the correct device
+            for state in optimizer.state.values():
+                for k, v in state.items():
+                    if isinstance(v, torch.Tensor):
+                        state[k] = v.to(device_id)
+            if distributed_state.is_main_process:
+                print(f"[Resume] Loaded optimizer + scheduler state from {trainer_state_path}")
+        else:
+            if distributed_state.is_main_process:
+                print(f"[Resume] WARNING: no trainer_state at {trainer_state_path}; "
+                      f"optimizer/scheduler start fresh (expected on first resume after this fix)")
+                
+        target = int(cfg.resume_step)
+        while scheduler.last_epoch < target:
+            scheduler.step()
+
+        if distributed_state.is_main_process:
+            print(f"[Resume] scheduler.last_epoch={scheduler.last_epoch}, "
+                f"lr={scheduler.get_last_lr()}, "
+                f"optimizer.lr={[g['lr'] for g in optimizer.param_groups]}")
+        
+        # If we just resumed from an emergency checkpoint, all state has been loaded successfully -> delete it.
+        if cfg.resume_from_emergency:
+            if distributed_state.is_main_process:
+                emergency_dir = Path(str(run_dir) + "--emergency_chkpt")
+                if emergency_dir.exists():
+                    print(f"[Emergency] Successfully loaded from {emergency_dir}; removing it.")
+                    shutil.rmtree(emergency_dir)
+            dist.barrier()
+            
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
@@ -1132,8 +1272,19 @@ def finetune(cfg: FinetuneConfig) -> None:
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
+    # Track wall-clock for emergency save
+    _slurm_start = os.environ.get("SLURM_JOB_START_TIME")
+    training_start_time = float(_slurm_start) if _slurm_start else time.time()
+    emergency_saved_this_run = False
+    wall_time_signal = torch.zeros(1, dtype=torch.int, device=device_id)
+    if distributed_state.is_main_process:
+        setup_elapsed = time.time() - training_start_time
+        print(f"[Chain] Wall-time budget anchored to SLURM start; setup took {setup_elapsed:.1f}s "
+              f"(budget={cfg.wall_time_limit_seconds}s, trigger at {cfg.wall_time_limit_seconds - setup_elapsed:.1f}s from now).")
+
     # Start training
-    with tqdm.tqdm(total=cfg.max_steps, leave=False) as progress:
+    initial_progress = int(cfg.resume_step) if (cfg.resume and cfg.resume_step) else 0
+    with tqdm.tqdm(initial=initial_progress, total=cfg.max_steps, leave=False) as progress:
         vla.train()
         optimizer.zero_grad()
         for batch_idx, batch in enumerate(dataloader):
@@ -1191,12 +1342,11 @@ def finetune(cfg: FinetuneConfig) -> None:
             if distributed_state.is_main_process and gradient_step_idx % cfg.wandb_log_freq == 0:
                 # Log the learning rate
                 # Make sure to do this AFTER any learning rate modifications (e.g., warmup/decay)
-                wandb.log(
-                    {
-                        "VLA Train/Learning Rate": scheduler.get_last_lr()[0],
-                    },
-                    step=log_step,
-                )
+                lrs = scheduler.get_last_lr()
+                lr_log = {"VLA Train/Learning Rate": lrs[0]}
+                if len(lrs) > 1:
+                    lr_log["VLA Train/VGGT Learning Rate"] = lrs[1]
+                wandb.log(lr_log, step=log_step)
 
             '''if cfg.action_head_freeze_steps > 0 and gradient_step_idx < cfg.action_head_freeze_steps:
                 for p in action_head.parameters():
@@ -1211,7 +1361,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 progress.update()
 
             # Save model checkpoint: either keep latest checkpoint only or all checkpoints
-            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0:
+            if gradient_step_idx > 0 and log_step % cfg.save_freq == 0 and (batch_idx + 1) % cfg.grad_accumulation_steps == 0:
                 save_training_checkpoint(
                     cfg=cfg,
                     run_dir=run_dir,
@@ -1225,7 +1375,53 @@ def finetune(cfg: FinetuneConfig) -> None:
                     distributed_state=distributed_state,
                     new_state_dict=RAW_STATE_DICT,
                     vggt_query_module=vggt_query_module if cfg.use_vggt else None,
+                    optimizer=optimizer,                        
+                    scheduler=scheduler,                         
                 )
+            
+            # Emergency wall-time checkpoint: fire once per job, on a gradient-step boundary,
+            # with a rank-coordinated decision so all ranks call save_training_checkpoint together.
+            if (
+                cfg.wall_time_limit_seconds > 0
+                and not emergency_saved_this_run
+                and (batch_idx + 1) % cfg.grad_accumulation_steps == 0
+                and check_wall_time_limit(
+                    training_start_time,
+                    cfg.wall_time_limit_seconds,
+                    wall_time_signal,
+                    distributed_state.is_main_process,
+                )
+            ):
+                if distributed_state.is_main_process:
+                    print(f"[Emergency] Wall time reached at step {log_step}; saving emergency checkpoint...")
+                # Release gradient buffers + cached allocator memory on every rank before the save.
+                # Non-main ranks otherwise sit in dist.barrier holding their full working set,
+                # which leaves the cgroup too close to its limit for rank 0's I/O bursts.
+                optimizer.zero_grad(set_to_none=True)
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                save_training_checkpoint(
+                    cfg=cfg, run_dir=run_dir, log_step=log_step,
+                    vla=vla, processor=processor,
+                    proprio_projector=proprio_projector if cfg.use_proprio else None,
+                    noisy_action_projector=None,
+                    action_head=action_head,
+                    train_dataset=train_dataset,
+                    distributed_state=distributed_state,
+                    new_state_dict=RAW_STATE_DICT,
+                    vggt_query_module=vggt_query_module if cfg.use_vggt else None,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    is_emergency=True,
+                )
+                emergency_saved_this_run = True
+                if distributed_state.is_main_process:
+                    print(f"[Emergency] Save complete at step {log_step}; exiting cleanly for chain resume.")
+                dist.barrier()
+                if dist.is_initialized():
+                    dist.destroy_process_group()
+                sys.exit(85)
 
             # Test model on validation set
             if cfg.use_val_set and log_step > 0 and log_step % cfg.val_freq == 0:

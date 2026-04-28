@@ -52,6 +52,8 @@ class L1RegressionActionHead(nn.Module):
         device = actions_hidden_states.device
 
         proprio = proprio.reshape(batch_size, -1).to(torch.bfloat16)  # (bsz, proprio_dim)
+        '''if phase == "Training":
+            proprio = proprio + torch.randn_like(proprio) * 0.01'''
         proprio_features = proprio_projector(proprio)  # (bsz, llm_dim)
         proprio_features = proprio_features.unsqueeze(dim=1)  # (bsz, 1, llm_dim)
 
@@ -68,11 +70,11 @@ class L1RegressionActionHead(nn.Module):
             batch_size, NUM_ACTIONS_CHUNK, -1
         )  # (batch, chunk_len, action_dim * hidden_dim)
 
-        if phase == "Training":
+        '''if phase == "Training":
             batch_size, seq_len, dim = rearranged_actions_hidden_states.shape
             random_perturbations = learnable_random_perturbations(seq_len, dim, device=rearranged_actions_hidden_states.device, dtype=rearranged_actions_hidden_states.dtype) 
             rearranged_actions_hidden_states = (rearranged_actions_hidden_states + random_perturbations) # (1, seq_len, dim)
-
+        '''
         action = self.model(
             rearranged_actions_hidden_states,
             h_a=actions_hidden_states,
