@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH -n 4
 #SBATCH --mem=64G
-#SBATCH -t 2:00:00
+#SBATCH -t 6:00:00
 #SBATCH -o /users/mfenner1/workspace/csci2951K/final_project/GVLA/logs/finetune_gvla_%j.out
 #SBATCH -e /users/mfenner1/workspace/csci2951K/final_project/GVLA/logs/finetune_gvla_%j.err
 

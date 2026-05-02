@@ -21,7 +21,6 @@ Output: output/FINAL-GVLA-v2-merged/
 
 import shutil
 import sys
-import zipfile
 from pathlib import Path
 
 import torch
@@ -37,7 +36,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 
 
 GVLA_ROOT       = Path(__file__).resolve().parents[3]
-ZIP_PATH        = GVLA_ROOT / "output" / "FINAL-GVLA-v2(6-layer-stride2)--110000_chkpt.zip"
+GVLA_CKPT_DIR   = Path("/users/mfenner1/scratch/GVLA_checkpoints/FINAL-GVLA-v2(6-layer-stride2)--110000_chkpt")
 BASE_CHECKPOINT = GVLA_ROOT / "output" / "LIBERO-Spatial-Pro"
 OUT_DIR         = GVLA_ROOT / "output" / "FINAL-GVLA-v2-merged"
 
@@ -71,16 +70,11 @@ def _register_hf_classes():
 
 def main():
     # -----------------------------------------------------------------------
-    # 1. Unzip the GVLA checkpoint
+    # 1. Locate pre-extracted GVLA checkpoint
     # -----------------------------------------------------------------------
-    print(f"Unzipping {ZIP_PATH} ...")
-    with zipfile.ZipFile(ZIP_PATH, "r") as zf:
-        zf.extractall(GVLA_ROOT / "output")
-
-    # Locate the extracted directory (it's the top-level entry in the zip)
-    gvla_dir = GVLA_ROOT / "output" / "FINAL-GVLA-v2(6-layer-stride2)--110000_chkpt"
-    assert gvla_dir.is_dir(), f"Expected extracted dir not found: {gvla_dir}"
-    print(f"Extracted to {gvla_dir}")
+    gvla_dir = GVLA_CKPT_DIR
+    assert gvla_dir.is_dir(), f"GVLA checkpoint dir not found: {gvla_dir}"
+    print(f"Using GVLA checkpoint from {gvla_dir}")
 
     lora_adapter_dir = gvla_dir / "lora_adapter"
     assert lora_adapter_dir.is_dir(), "lora_adapter/ not found inside extracted checkpoint"

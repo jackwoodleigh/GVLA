@@ -85,7 +85,7 @@ class FinetuneConfig:
     load_in_4bit: bool = False
 
     # --- Dataset ---
-    episodes_dir: str = "/users/mfenner1/workspace/csci2951K/final_project/episodes_bowl_pickplace"
+    episodes_dir: str = "/oscar/scratch/mfenner1/datasets/bowl_on_plate_pickplace_60/train"
     task_instruction: str = "pick up the blue bowl next to the plate and place it on the plate"
 
     # --- Output ---
@@ -98,10 +98,10 @@ class FinetuneConfig:
     # --- Training ---
     batch_size: int = 4
     learning_rate: float = 2e-5
-    lr_warmup_steps: int = 20           # linear warmup over first N steps
-    max_steps: int = 300
+    lr_warmup_steps: int = 200          # linear warmup over first N steps
+    max_steps: int = 10000
     grad_accumulation_steps: int = 1
-    save_freq: int = 100                # checkpoint every N steps (also at end)
+    save_freq: int = 2000               # checkpoint every N steps (also at end)
     seed: int = 42
 
 

@@ -91,7 +91,7 @@ class FinetuneGVLAConfig:
     load_in_4bit: bool = False
 
     # --- Dataset ---
-    episodes_dir: str = "/users/mfenner1/workspace/csci2951K/final_project/episodes_bowl_pickplace"
+    episodes_dir: str = "/oscar/scratch/mfenner1/datasets/bowl_on_plate_pickplace_60/train"
     task_instruction: str = "pick up the blue bowl next to the plate and place it on the plate"
 
     # --- Output ---
@@ -104,10 +104,10 @@ class FinetuneGVLAConfig:
     # --- Training ---
     batch_size: int = 2
     learning_rate: float = 2e-5
-    lr_warmup_steps: int = 20
-    max_steps: int = 300
+    lr_warmup_steps: int = 200
+    max_steps: int = 10000
     grad_accumulation_steps: int = 1
-    save_freq: int = 100
+    save_freq: int = 2000
     seed: int = 42
 
     # --- VGGT ---
